@@ -7,6 +7,7 @@
 # 5. 添加保存到 CSV 的函数，路径为 data/ 目录下
 # 6. 添加基本的错误处理和数据清洗
 
+import logging
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,8 @@ from typing import Optional
 import akshare as ak
 import pandas as pd
 import yfinance as yf
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 GOLD_CACHE = DATA_DIR / "gold_gc_f.csv"
@@ -52,7 +55,13 @@ def _clean_price_dataframe(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     )
 
     # Normalize to date (naive) to reduce timezone drift across sources.
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+    # yfinance returns UTC-aware timestamps; akshare returns naive timestamps.
+    # Convert any aware timestamp to Asia/Shanghai first, then strip tz,
+    # so dates are anchored to China local time and never drift by 1 day.
+    dt_col = pd.to_datetime(df["Date"])
+    if dt_col.dt.tz is not None:
+        dt_col = dt_col.dt.tz_convert("Asia/Shanghai")
+    df["Date"] = dt_col.dt.tz_localize(None).dt.normalize()
     if "Volume" not in df.columns:
         df["Volume"] = 0
 
@@ -102,7 +111,8 @@ def _fetch_gold_from_akshare(start: datetime, end: Optional[datetime]) -> Option
             cleaned = _filter_date_range(cleaned, start, end)
             if not cleaned.empty:
                 return cleaned
-        except Exception:
+        except Exception as exc:
+            logger.warning("akshare %s/%s failed: %s", symbol, market, exc)
             continue
 
     return None
@@ -114,10 +124,11 @@ def _fetch_gold_from_stooq(start: datetime, end: Optional[datetime]) -> Optional
         raw = pd.read_csv(url)
         if raw is None or raw.empty:
             return None
-        cleaned = _clean_price_dataframe(raw, symbol="XAUUSD")
+        cleaned = _clean_price_dataframe(raw, symbol="GC=F")
         cleaned = _filter_date_range(cleaned, start, end)
         return cleaned if not cleaned.empty else None
-    except Exception:
+    except Exception as exc:
+        logger.warning("Stooq gold fetch failed: %s", exc)
         return None
 
 
@@ -138,7 +149,7 @@ def fetch_gold_futures(
         cached = _clean_price_dataframe(cached, symbol="GC=F")
         cached_slice = _filter_date_range(cached, start, end)
         if not cached_slice.empty:
-            return cached_slice.reset_index(drop=True)
+            return cached_slice
 
     # 1) Try akshare COMEX GC 合约
     ak_df = _fetch_gold_from_akshare(start, end)
@@ -156,7 +167,7 @@ def fetch_gold_futures(
             stooq_df.to_csv(GOLD_CACHE, index=False)
         return stooq_df
 
-    # 2) Fallback to Yahoo Finance with retry/backoff
+    # 3) Fallback to Yahoo Finance with retry/backoff
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
@@ -181,10 +192,9 @@ def fetch_gold_futures(
         if use_cache and GOLD_CACHE.exists():
             cached = pd.read_csv(GOLD_CACHE, parse_dates=["Date"])
             cached = _clean_price_dataframe(cached, symbol="GC=F")
-            mask = (cached["Date"] >= start) & ((cached["Date"] <= end) if end else True)
-            cached_slice = cached.loc[mask]
+            cached_slice = _filter_date_range(cached, start, end)
             if not cached_slice.empty:
-                return cached_slice.reset_index(drop=True)
+                return cached_slice
 
         msg = "Failed to download GC=F from Yahoo Finance; likely rate limited."
         if last_exc:
