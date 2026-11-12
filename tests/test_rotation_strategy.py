@@ -356,3 +356,66 @@ class TestWalkForwardValidation:
 		with pytest.raises(ValueError):
 			walk_forward_validation(gold, equity, train_days=252, test_days=63)
 
+
+# ---------------------------------------------------------------------------
+# ETF dividend (qfq) adjustment
+# ---------------------------------------------------------------------------
+
+class TestDividendAdjustment:
+	def _prices(self, closes):
+		dates = pd.bdate_range("2020-01-01", periods=len(closes))
+		return pd.DataFrame({
+			"Date": dates,
+			"Open": closes,
+			"High": closes,
+			"Low": closes,
+			"Close": closes,
+			"Volume": 1000,
+		})
+
+	def test_ex_date_return_includes_dividend_exactly(self):
+		pytest.importorskip("akshare")
+		from src.data_fetcher import _apply_dividend_adjustment
+
+		df = self._prices([100.0, 101.0, 102.0, 90.0, 91.0, 92.0])
+		div = pd.DataFrame({"Date": [df["Date"].iloc[3]], "Dividend": [3.0]})
+		adj = _apply_dividend_adjustment(df, div)
+
+		# Prices on/after the ex-date stay raw.
+		assert adj["Close"].iloc[3:].tolist() == pytest.approx([90.0, 91.0, 92.0])
+		# Pre-ex prices are scaled so the ex-date return is the total return.
+		expected_return = (90.0 + 3.0) / 102.0 - 1
+		actual_return = adj["Close"].iloc[3] / adj["Close"].iloc[2] - 1
+		assert actual_return == pytest.approx(expected_return, rel=1e-12)
+		# The latest price must not change (standard qfq anchor).
+		assert adj["Close"].iloc[-1] == pytest.approx(92.0)
+
+	def test_multiple_dividends_compound(self):
+		pytest.importorskip("akshare")
+		from src.data_fetcher import _apply_dividend_adjustment
+
+		df = self._prices([100.0, 100.0, 95.0, 95.0, 90.0, 90.0])
+		div = pd.DataFrame({
+			"Date": [df["Date"].iloc[2], df["Date"].iloc[4]],
+			"Dividend": [2.0, 3.0],
+		})
+		adj = _apply_dividend_adjustment(df, div)
+
+		# Each ex-date return equals its total return.
+		assert adj["Close"].iloc[2] / adj["Close"].iloc[1] - 1 == pytest.approx(
+			(95.0 + 2.0) / 100.0 - 1, rel=1e-12
+		)
+		assert adj["Close"].iloc[4] / adj["Close"].iloc[3] - 1 == pytest.approx(
+			(90.0 + 3.0) / 95.0 - 1, rel=1e-12
+		)
+		assert adj["Close"].iloc[-1] == pytest.approx(90.0)
+
+	def test_empty_dividends_is_noop(self):
+		pytest.importorskip("akshare")
+		from src.data_fetcher import _apply_dividend_adjustment
+
+		df = self._prices([1.0, 2.0, 3.0])
+		adj = _apply_dividend_adjustment(df, pd.DataFrame(columns=["Date", "Dividend"]))
+		assert adj["Close"].tolist() == pytest.approx([1.0, 2.0, 3.0])
+
+

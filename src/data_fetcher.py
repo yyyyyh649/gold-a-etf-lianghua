@@ -251,9 +251,14 @@ def _fetch_a_share_from_sina(code: str, is_etf: bool) -> pd.DataFrame:
 def _adjust_etf_for_dividends(df: pd.DataFrame, sina_symbol: str) -> pd.DataFrame:
     """Apply forward (qfq) adjustment to a Sina ETF series using its dividends.
 
-    Sina's ETF history is unadjusted. We rebuild a total-return-like series by
-    multiplying pre-ex-date OHLC by ``1 - dividend / prev_close`` for every
-    cash distribution, which is the standard ratio-based qfq method.
+    Sina's ETF history is unadjusted. For each cash distribution we scale all
+    prices *before* its ex-date by ``ex_close / (ex_close + dividend)``.
+
+    This makes the ex-date daily return exactly
+    ``(ex_close + dividend) / prev_close - 1`` — i.e. the dividend is fully
+    counted as total return, regardless of market moves on the ex-date. (The
+    common ``1 - dividend / prev_close`` approximation is only exact when the
+    price drop equals the dividend.)
     """
     try:
         div = ak.fund_etf_dividend_sina(symbol=sina_symbol)
@@ -269,24 +274,49 @@ def _adjust_etf_for_dividends(df: pd.DataFrame, sina_symbol: str) -> pd.DataFram
     div = div.dropna().sort_values("日期")
     if div.empty:
         return df
+
     # Convert the cumulative series into per-event cash dividends.
-    div["dividend"] = div["累计分红"].diff().fillna(div["累计分红"])
+    events = pd.DataFrame(
+        {
+            "Date": div["日期"],
+            "Dividend": div["累计分红"].diff().fillna(div["累计分红"]),
+        }
+    )
+    return _apply_dividend_adjustment(df, events)
+
+
+def _apply_dividend_adjustment(df: pd.DataFrame, dividends: pd.DataFrame) -> pd.DataFrame:
+    """Pure qfq adjustment: ``dividends`` has Date and per-event Dividend columns."""
+    if dividends is None or dividends.empty:
+        return df
+
+    events = dividends.copy()
+    events["Date"] = pd.to_datetime(events["Date"])
+    events["Dividend"] = pd.to_numeric(events["Dividend"], errors="coerce")
+    events = events.dropna().sort_values("Date")
 
     out = df.sort_values("Date").reset_index(drop=True)
     price_cols = ["Open", "High", "Low", "Close"]
-    for _, event in div.iterrows():
-        ex_date, amount = event["日期"], float(event["dividend"])
+    for _, event in events.iterrows():
+        ex_date, amount = event["Date"], float(event["Dividend"])
         if amount <= 0:
             continue
-        prior = out.loc[out["Date"] < ex_date, "Close"]
-        if prior.empty:
+
+        # First trading day on/after the ex-date; prices strictly before it are
+        # the only ones that need adjusting (the ex-date close already reflects
+        # the distribution).
+        after = out.index[out["Date"] >= ex_date]
+        if len(after) == 0:
             continue
-        prev_close = float(prior.iloc[-1])
-        if prev_close <= 0 or amount >= prev_close:
+        ex_pos = after[0]
+        ex_close = float(out.at[ex_pos, "Close"])
+        if ex_close <= 0:
             continue
-        ratio = 1.0 - amount / prev_close
-        older = out["Date"] < ex_date
-        out.loc[older, price_cols] = out.loc[older, price_cols] * ratio
+
+        ratio = ex_close / (ex_close + amount)
+        older = out.index < ex_pos
+        if older.any():
+            out.loc[older, price_cols] = out.loc[older, price_cols] * ratio
 
     return out
 
