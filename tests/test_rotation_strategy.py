@@ -103,8 +103,38 @@ class TestPreparePrices:
 class TestGenerateSignals:
 	def test_output_columns(self, sample_gold, sample_equity):
 		result = generate_signals(sample_gold, sample_equity)
-		expected = {"signal", "position", "gold_ret", "equity_ret", "portfolio_ret"}
+		expected = {
+			"signal", "position", "gold_ret", "equity_ret", "portfolio_ret",
+			"mom_gold", "mom_equity",
+		}
 		assert expected.issubset(set(result.columns))
+
+	def test_monthly_rebalance_supported(self):
+		"""Monthly mode must not crash (regression: pandas 3.x removed the 'M' alias)."""
+		dates = pd.bdate_range("2020-01-01", periods=800)
+		gold = pd.DataFrame({"Date": dates, "Close": np.linspace(1500, 2000, len(dates))})
+		equity = pd.DataFrame(
+			{"Date": dates, "Close": 100 + np.sin(np.arange(len(dates)) / 30) * 5}
+		)
+		cfg = RotationConfig(lookback_days=60, rebalance="monthly")
+		result = generate_signals(gold, equity, config=cfg)
+		assert not result.empty
+		assert result["position"].isin({"GOLD", "EQUITY", "CASH"}).all()
+		assert result["mom_gold"].notna().any()
+		assert result["mom_equity"].notna().any()
+
+	def test_warmup_momentum_is_nan_then_valid(self):
+		"""Momentum is NaN during warm-up and populated afterwards."""
+		dates = pd.bdate_range("2020-01-01", periods=400)
+		gold = pd.DataFrame({"Date": dates, "Close": np.linspace(1500, 2000, len(dates))})
+		equity = pd.DataFrame({"Date": dates, "Close": np.linspace(100, 150, len(dates))})
+		cfg = RotationConfig(lookback_days=60, rebalance="weekly")
+		result = generate_signals(gold, equity, config=cfg)
+		mom = result[["mom_gold", "mom_equity"]]
+		assert mom.iloc[0].isna().all()
+		assert mom.notna().all(axis=1).any()
+		first_valid = mom.notna().all(axis=1).idxmax()
+		assert (result.loc[first_valid:, "position"] != "CASH").any()
 
 	def test_signal_is_valid_choice(self, sample_gold, sample_equity):
 		cfg = RotationConfig(cash_symbol="CASH")

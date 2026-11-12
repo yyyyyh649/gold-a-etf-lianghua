@@ -115,6 +115,7 @@ flowchart TB
   - `CASH ↔ ASSET`：1× fee（单边）
   - `ASSET ↔ ASSET`：2× fee（先卖后买）
 - **中美日历对齐**：`inner`（保守）或 `a_share_ffill`（默认，最多 ffill 5 天黄金缺失）两种模式。
+- **预热期处理**：动量回看窗口填满前策略只能持有现金，绩效统计会剔除该预热期，使策略与基准在同一投资区间内比较。
 - 同时输出策略净值曲线与基准（买入持有）净值曲线对比。
 
 ### 4. 绩效指标
@@ -166,14 +167,16 @@ Adapter (stub) quote example: {'symbol': '510300', 'status': 'stub', 'price': No
 
 ```
 多周期动量参数对比:
-          cagr      vol   sharpe   max_dd   calmar  last_nav
+          cagr      vol   sharpe   max_dd   calmar  last_nav  bench_cagr  bench_sharpe  excess_cagr
 lookback
-20d      0.0721   0.1352   0.5332  -0.1654   0.4360    1.8234
-60d      0.0812   0.1205   0.6738  -0.1432   0.5671    2.1500
-120d     0.0685   0.1183   0.5790  -0.1312   0.5221    1.9621
+20d      0.0138   0.1489   0.1635  -0.2513   0.0551    1.0584      0.1042        0.5907      -0.0903
+60d      0.0694   0.1546   0.4964  -0.2722   0.2550    1.3192      0.1042        0.5907      -0.0348
+120d     0.1253   0.1578   0.8018  -0.2000   0.6267    1.6282      0.1042        0.5907       0.0212
 
 Saved sweep results to /workspace/data/sweep_510300.csv
 ```
+
+> 参数扫描会剔除各窗口的动量预热期，并统一到同一评估起点再对比；同时给出 `bench_*` 与 `excess_cagr`，避免把市场 beta 误判为策略 alpha。
 
 ### 回测 CSV 输出字段
 
@@ -184,6 +187,8 @@ Saved sweep results to /workspace/data/sweep_510300.csv
 | `gold_ret` | 黄金日收益率 |
 | `equity_ret` | A 股日收益率 |
 | `portfolio_ret` | 策略组合日收益率（扣费后）|
+| `mom_gold` | 黄金动量（日频对齐，预热期为 NaN）|
+| `mom_equity` | A 股动量（日频对齐，预热期为 NaN）|
 | `strategy_curve` | 策略累计净值 |
 | `benchmark_curve` | 基准累计净值 |
 

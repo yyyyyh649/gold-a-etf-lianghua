@@ -36,12 +36,34 @@ logger = logging.getLogger(__name__)
 
 
 def compute_turnover(position_series: pd.Series, cash_symbol: str = "CASH") -> float:
-	"""Compute total one-way turnover as a fraction of total trading days."""
+	"""Average one-way turnover per trading day.
+
+	A cash↔asset switch is one one-way trade (1x). An asset↔asset switch is two
+	(sell the old asset, buy the new one), so it counts as 2x.
+	"""
 	if len(position_series) < 2:
 		return 0.0
-	# A trade happens when position changes (excluding cash ↔ cash)
-	changes = (position_series != position_series.shift(1)).sum() - 1  # first shift introduces 1 false positive
-	return max(0, changes) / len(position_series)
+	prev = position_series.shift(1)
+	changed = (position_series != prev) & prev.notna()
+	asset_swap = changed & (position_series != cash_symbol) & (prev != cash_symbol)
+	one_way_trades = changed.astype(int) + asset_swap.astype(int)
+	return float(one_way_trades.sum()) / len(position_series)
+
+
+def _trim_warmup(result: pd.DataFrame) -> pd.DataFrame:
+	"""Drop the pre-signal warm-up window from a backtest result.
+
+	Before the lookback window fills, both momentum series are NaN and the
+	strategy is forced into cash. Keeping those days in the performance metrics
+	biases the comparison: the strategy earns nothing while a buy-and-hold
+	benchmark is fully invested.
+	"""
+	if result.empty or not {"mom_gold", "mom_equity"}.issubset(result.columns):
+		return result
+	valid = result[["mom_gold", "mom_equity"]].notna().all(axis=1)
+	if not valid.any():
+		return result
+	return result.loc[valid.idxmax():]
 
 
 def run_validation(
@@ -71,22 +93,34 @@ def run_validation(
 	)
 	result = generate_signals(gold, equity, config=cfg)
 
+	# Drop the momentum warm-up so strategy and benchmark are compared over the
+	# same investable window instead of the strategy sitting in cash early on.
+	active = _trim_warmup(result)
+	if active.empty:
+		active = result
+	warmup_days = len(result) - len(active)
+	if warmup_days > 0:
+		print(
+			f"跳过预热期 {warmup_days} 个交易日"
+			f"（首个有效动量信号: {active.index[0]:%Y-%m-%d}）\n"
+		)
+
 	# ---------- benchmark: buy & hold equity ----------
-	benchmark_ret = result["equity_ret"]
+	benchmark_ret = active["equity_ret"]
 	benchmark_curve = (1 + benchmark_ret).cumprod().rename("benchmark_curve")
 
 	# ---------- strategy ----------
-	portfolio_ret = result["portfolio_ret"]
+	portfolio_ret = active["portfolio_ret"]
 	strategy_curve = (1 + portfolio_ret).cumprod().rename("strategy_curve")
 
 	metrics = performance_summary(portfolio_ret)
 	bench_metrics = performance_summary(benchmark_ret)
 
 	# Turnover
-	daily_turnover = compute_turnover(result["position"])
+	daily_turnover = compute_turnover(active["position"])
 	annual_turnover = daily_turnover * 252
 
-	# Preserve Date in output
+	# Preserve Date in output (warm-up rows keep NaN curves)
 	output = result.copy()
 	output["strategy_curve"] = strategy_curve
 	output["benchmark_curve"] = benchmark_curve

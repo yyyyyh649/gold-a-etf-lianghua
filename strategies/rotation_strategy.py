@@ -59,7 +59,8 @@ def _rebalance_index(prices: pd.DataFrame, mode: Rebalance) -> pd.DatetimeIndex:
 	if mode == "weekly":
 		return prices.resample("W-FRI").last().index
 	if mode == "monthly":
-		return prices.resample("M").last().index
+		# "ME" (month-end) replaces the removed "M" alias in pandas >= 2.2 / 3.x.
+		return prices.resample("ME").last().index
 	raise ValueError(f"Unsupported rebalance mode: {mode}")
 
 
@@ -70,32 +71,29 @@ def _compute_momentum_on_rebalance(
 ) -> pd.DataFrame:
 	"""Compute asset momentum on rebalance-frequency bars.
 
-	Instead of computing pct_change(N) on daily data (which changes meaning
-	depending on trading calendar density), this function:
-	1. Resamples prices to the rebalance frequency (weekly/monthly)
-	2. Computes returns over a number of bars that approximates the
-	   same calendar span as ``lookback_days`` on daily data
+	Instead of computing ``pct_change(N)`` on daily data (whose meaning shifts
+	with trading-calendar density), resample to the rebalance frequency and use
+	a number of bars that covers approximately the same number of trading days
+	as ``lookback_days``:
 
-	Mapping:
-	- daily rebalance  → lookback = lookback_days bars (daily)
-	- weekly rebalance → lookback = max(1, lookback_days // 5) bars (weeks)
-	- monthly rebalance → lookback = max(1, lookback_days // 20) bars (months)
+	- daily rebalance   → lookback_days daily bars
+	- weekly rebalance  → max(1, lookback_days // 5) weekly bars
+	- monthly rebalance → max(1, lookback_days // 20) monthly bars
+
+	Returns a DataFrame indexed at the resample bar labels (week/month end).
 	"""
 	if mode == "daily":
-		resampled = prices
-		periods = lookback_days
-	elif mode == "weekly":
+		return prices.pct_change(lookback_days)
+	if mode == "weekly":
 		resampled = prices.resample("W-FRI").last().dropna()
 		periods = max(1, lookback_days // 5)
 	elif mode == "monthly":
-		resampled = prices.resample("M").last().dropna()
+		resampled = prices.resample("ME").last().dropna()
 		periods = max(1, lookback_days // 20)
 	else:
 		raise ValueError(f"Unsupported rebalance mode: {mode}")
 
-	momentum = resampled.pct_change(periods).dropna()
-	momentum_daily = momentum.reindex(prices.index).ffill()
-	return momentum_daily
+	return resampled.pct_change(periods).dropna()
 
 
 def parameter_sweep(
@@ -104,30 +102,51 @@ def parameter_sweep(
 	lookback_windows: Optional[List[int]] = None,
 	rebalance: Rebalance = "weekly",
 ) -> pd.DataFrame:
-	"""Run the strategy across multiple lookback windows and return a comparison table."""
+	"""Run the strategy across multiple lookback windows and return a comparison table.
+
+	All windows are evaluated over the same out-of-warm-up period (the latest
+	first-valid-momentum date across windows) so the comparison is not skewed by
+	windows simply starting earlier. Benchmark (buy & hold equity) metrics are
+	included to separate alpha from beta.
+	"""
 
 	if lookback_windows is None:
 		lookback_windows = [20, 60, 120]
 
-	results: Dict[int, dict] = {}
+	frames: Dict[int, pd.DataFrame] = {}
+	first_valid_dates: List[pd.Timestamp] = []
 	for lb in lookback_windows:
 		cfg = RotationConfig(lookback_days=lb, rebalance=rebalance)
 		result = generate_signals(gold, equity, config=cfg)
-		metrics = performance_summary(result["portfolio_ret"])
-		results[lb] = metrics
+		frames[lb] = result
+		if not result.empty:
+			valid = result[["mom_gold", "mom_equity"]].notna().all(axis=1)
+			if valid.any():
+				first_valid_dates.append(valid.idxmax())
+
+	common_start = max(first_valid_dates) if first_valid_dates else None
 
 	rows = []
 	for lb in lookback_windows:
-		m = results[lb]
+		result = frames[lb]
+		if common_start is not None and not result.empty:
+			result = result.loc[common_start:]
+		metrics = performance_summary(result["portfolio_ret"])
+		bench = performance_summary(result["equity_ret"])
+		cagr = metrics.get("cagr", float("nan"))
+		bench_cagr = bench.get("cagr", float("nan"))
 		rows.append(
 			{
 				"lookback": f"{lb}d",
-				"cagr": m.get("cagr", float("nan")),
-				"vol": m.get("vol", float("nan")),
-				"sharpe": m.get("sharpe", float("nan")),
-				"max_dd": m.get("max_drawdown", float("nan")),
-				"calmar": m.get("calmar", float("nan")),
-				"last_nav": m.get("last_value", float("nan")),
+				"cagr": cagr,
+				"vol": metrics.get("vol", float("nan")),
+				"sharpe": metrics.get("sharpe", float("nan")),
+				"max_dd": metrics.get("max_drawdown", float("nan")),
+				"calmar": metrics.get("calmar", float("nan")),
+				"last_nav": metrics.get("last_value", float("nan")),
+				"bench_cagr": bench_cagr,
+				"bench_sharpe": bench.get("sharpe", float("nan")),
+				"excess_cagr": cagr - bench_cagr,
 			}
 		)
 	return pd.DataFrame(rows).set_index("lookback")
@@ -140,8 +159,9 @@ def generate_signals(
 ) -> pd.DataFrame:
 	"""Create allocation signals using lookback momentum.
 
-	Returns a dataframe with columns: signal, position, gold_ret, equity_ret, portfolio_ret.
-	position is one of ["GOLD", "EQUITY", config.cash_symbol].
+	Returns a dataframe with columns: signal, position, gold_ret, equity_ret,
+	portfolio_ret, mom_gold, mom_equity. position is one of
+	["GOLD", "EQUITY", config.cash_symbol].
 
 	Look-ahead bias protection:
 	- Momentum is computed using T-period returns ending at close(T).
@@ -157,19 +177,24 @@ def generate_signals(
 	if prices.empty:
 		# No overlapping trading dates → nothing to simulate.
 		return pd.DataFrame(
-			columns=["signal", "position", "gold_ret", "equity_ret", "portfolio_ret"]
+			columns=[
+				"signal", "position", "gold_ret", "equity_ret", "portfolio_ret",
+				"mom_gold", "mom_equity",
+			]
 		)
 
 	daily_ret = prices.pct_change().fillna(0.0)
 
 	# --- Momentum on rebalance-frequency bars ---
-	# Use resampled returns so the lookback period has a stable calendar meaning.
+	# Use resampled returns so the lookback period has a stable trading-day span.
 	momentum = _compute_momentum_on_rebalance(
 		prices, cfg.rebalance, lookback_days=cfg.lookback_days,
 	)
 
 	rebalance_dates = _rebalance_index(prices, cfg.rebalance)
-	momentum_reb = momentum.reindex(rebalance_dates).dropna()
+	# Align momentum to rebalance dates (forward-fill tolerates a holiday bar)
+	# then drop the leading warm-up rows that have no momentum yet.
+	momentum_reb = momentum.reindex(rebalance_dates).ffill().dropna()
 
 	pick = momentum_reb.idxmax(axis=1)
 	pick_df = pick.to_frame("position_raw")
@@ -199,8 +224,6 @@ def generate_signals(
 	)
 	# When both are assets and they're different → 2x fee
 	asset_swap = both_assets * (1 - same)
-	# When one side is cash → 1x fee
-	cash_touch = (1 - same) * (1 - asset_swap)
 
 	turnover = (1 - same)  # any change triggers a trade
 	fee = turnover * (cfg.fee_bps / 10000.0) * (1.0 + asset_swap)
@@ -219,6 +242,10 @@ def generate_signals(
 	portfolio_ret = alloc_gold * gold_ret + alloc_equity * equity_ret + alloc_cash * cash_daily
 	portfolio_ret = portfolio_ret - fee
 
+	# Expose daily-aligned momentum so callers can detect and trim the warm-up
+	# period (before both momentum series are available).
+	momentum_daily = momentum.reindex(daily_ret.index).ffill()
+
 	return pd.DataFrame(
 		{
 			"signal": signal_series,
@@ -226,6 +253,8 @@ def generate_signals(
 			"gold_ret": gold_ret,
 			"equity_ret": equity_ret,
 			"portfolio_ret": portfolio_ret,
+			"mom_gold": momentum_daily["GOLD"],
+			"mom_equity": momentum_daily["EQUITY"],
 		}
 	)
 

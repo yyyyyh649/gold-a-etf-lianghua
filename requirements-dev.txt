@@ -2,7 +2,7 @@
 # 生产环境请使用 requirements.txt（锁定版本）
 akshare>=1.18
 yfinance>=1.1
-pandas>=2.0
+pandas>=2.2
 numpy>=1.24
 
 # 开发工具
