@@ -85,35 +85,56 @@ def _filter_date_range(df: pd.DataFrame, start: datetime, end: Optional[datetime
 
 
 def _fetch_gold_from_akshare(start: datetime, end: Optional[datetime]) -> Optional[pd.DataFrame]:
-    if not hasattr(ak, "futures_foreign_commodity_hist"):
-        return None
+    # 1) Eastmoney COMEX futures (only exposed by some akshare builds).
+    if hasattr(ak, "futures_foreign_commodity_hist"):
+        ak_start = start.strftime("%Y%m%d")
+        ak_end = end.strftime("%Y%m%d") if end else datetime.today().strftime("%Y%m%d")
+        candidates = [
+            ("GC", "COMEX"),
+            ("GOLD", "COMEX"),
+            ("GC", "NYMEX"),
+        ]
 
-    ak_start = start.strftime("%Y%m%d")
-    ak_end = end.strftime("%Y%m%d") if end else datetime.today().strftime("%Y%m%d")
-    candidates = [
-        ("GC", "COMEX"),
-        ("GOLD", "COMEX"),
-        ("GC", "NYMEX"),
-    ]
+        for symbol, market in candidates:
+            try:
+                raw = ak.futures_foreign_commodity_hist(
+                    symbol=symbol,
+                    market=market,
+                    start_date=ak_start,
+                    end_date=ak_end,
+                )
+                if raw is None or raw.empty:
+                    continue
 
-    for symbol, market in candidates:
-        try:
-            raw = ak.futures_foreign_commodity_hist(
-                symbol=symbol,
-                market=market,
-                start_date=ak_start,
-                end_date=ak_end,
-            )
-            if raw is None or raw.empty:
+                cleaned = _clean_price_dataframe(raw, symbol="GC=F")
+                cleaned = _filter_date_range(cleaned, start, end)
+                if not cleaned.empty:
+                    return cleaned
+            except Exception as exc:
+                logger.warning("akshare %s/%s failed: %s", symbol, market, exc)
                 continue
 
+    # 2) Sina COMEX continuous contract (USD/oz) — same underlying as GC=F.
+    if hasattr(ak, "futures_foreign_hist"):
+        try:
+            raw = ak.futures_foreign_hist(symbol="GC")
             cleaned = _clean_price_dataframe(raw, symbol="GC=F")
             cleaned = _filter_date_range(cleaned, start, end)
             if not cleaned.empty:
                 return cleaned
         except Exception as exc:
-            logger.warning("akshare %s/%s failed: %s", symbol, market, exc)
-            continue
+            logger.warning("akshare Sina COMEX GC failed: %s", exc)
+
+    # 3) SHFE gold continuous contract (CNY/gram) as a last akshare resort.
+    if hasattr(ak, "futures_zh_daily_sina"):
+        try:
+            raw = ak.futures_zh_daily_sina(symbol="AU0")
+            cleaned = _clean_price_dataframe(raw, symbol="GC=F")
+            cleaned = _filter_date_range(cleaned, start, end)
+            if not cleaned.empty:
+                return cleaned
+        except Exception as exc:
+            logger.warning("akshare SHFE AU0 failed: %s", exc)
 
     return None
 
@@ -212,10 +233,27 @@ def fetch_gold_futures(
     return cleaned
 
 
+def _sina_quote_symbol(code: str, is_etf: bool) -> str:
+    """Map a bare A-share code to Sina's prefixed symbol (e.g. sh510300)."""
+    if is_etf:
+        return ("sh" if code.startswith("5") else "sz") + code
+    return ("sz" if code.startswith("399") else "sh") + code
+
+
+def _fetch_a_share_from_sina(code: str, is_etf: bool) -> pd.DataFrame:
+    """Fallback A-share history via Sina (used when Eastmoney is unreachable)."""
+    sina_symbol = _sina_quote_symbol(code, is_etf)
+    if is_etf:
+        return ak.fund_etf_hist_sina(symbol=sina_symbol)
+    return ak.stock_zh_index_daily(symbol=sina_symbol)
+
+
 def fetch_a_share_index_or_etf(
     symbol: str, start_date: str, end_date: Optional[str] = None, is_etf: Optional[bool] = None
 ) -> pd.DataFrame:
     """Fetch A-share index or ETF using akshare.
+
+    Tries Eastmoney first, then falls back to Sina when Eastmoney is blocked.
 
     Args:
         symbol: e.g., "000001" for 上证指数 or "510300" for 沪深300ETF. Suffix (.SH/.SZ) is optional.
@@ -232,23 +270,28 @@ def fetch_a_share_index_or_etf(
     if is_etf is None:
         is_etf = code.startswith(("5", "1"))
 
-    if is_etf:
-        raw = ak.fund_etf_hist_em(
-            symbol=code,
-            start_date=start_str,
-            end_date=end_str,
-            adjust="qfq",
-        )
-    else:
-        raw = ak.index_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_str,
-            end_date=end_str,
-            adjust="",
-        )
+    try:
+        if is_etf:
+            raw = ak.fund_etf_hist_em(
+                symbol=code,
+                start_date=start_str,
+                end_date=end_str,
+                adjust="qfq",
+            )
+        else:
+            raw = ak.index_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start_str,
+                end_date=end_str,
+                adjust="",
+            )
+    except Exception as exc:
+        logger.warning("Eastmoney A-share fetch failed (%s); falling back to Sina", exc)
+        raw = _fetch_a_share_from_sina(code, is_etf)
 
-    return _clean_price_dataframe(raw, symbol=code)
+    cleaned = _clean_price_dataframe(raw, symbol=code)
+    return _filter_date_range(cleaned, start, end_dt)
 
 
 def save_data(df: pd.DataFrame, filename: str) -> Path:
