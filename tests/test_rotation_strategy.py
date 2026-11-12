@@ -10,6 +10,7 @@ from strategies.rotation_strategy import (
 	generate_signals,
 	performance_summary,
 	parameter_sweep,
+	walk_forward_validation,
 )
 
 
@@ -305,3 +306,53 @@ class TestParameterSweep:
 		sweep = parameter_sweep(sample_gold, sample_equity, lookback_windows=[3, 5])
 		assert "3d" in sweep.index
 		assert "5d" in sweep.index
+
+
+# ---------------------------------------------------------------------------
+# walk_forward_validation
+# ---------------------------------------------------------------------------
+
+class TestWalkForwardValidation:
+	def _data(self, periods: int = 1500):
+		dates = pd.bdate_range("2016-01-04", periods=periods)
+		rng = np.random.default_rng(7)
+		gold = pd.DataFrame({
+			"Date": dates,
+			"Close": 1300 * np.exp(np.cumsum(rng.normal(0.0003, 0.008, periods))),
+		})
+		equity = pd.DataFrame({
+			"Date": dates,
+			"Close": 3000 * np.exp(np.cumsum(rng.normal(0.0002, 0.012, periods))),
+		})
+		return gold, equity
+
+	def test_returns_oos_track_record(self):
+		gold, equity = self._data()
+		wf = walk_forward_validation(
+			gold, equity, lookback_windows=[20, 60],
+			train_days=252, test_days=63, rebalance="weekly",
+		)
+		assert {"oos_returns", "oos_benchmark_returns", "metrics", "benchmark_metrics", "splits"}.issubset(wf)
+		splits = wf["splits"]
+		assert len(splits) > 0
+		assert splits["lookback"].isin([20, 60]).all()
+		# OOS series is the concatenation of every test window.
+		assert len(wf["oos_returns"]) == len(splits) * 63
+		assert "cagr" in wf["metrics"]
+		assert "cagr" in wf["benchmark_metrics"]
+
+	def test_test_windows_do_not_overlap(self):
+		gold, equity = self._data()
+		wf = walk_forward_validation(
+			gold, equity, lookback_windows=[20, 60],
+			train_days=252, test_days=63,
+		)
+		splits = wf["splits"]
+		for i in range(1, len(splits)):
+			assert splits["test_start"].iloc[i] > splits["test_end"].iloc[i - 1]
+
+	def test_raises_when_not_enough_data(self):
+		gold, equity = self._data(periods=200)
+		with pytest.raises(ValueError):
+			walk_forward_validation(gold, equity, train_days=252, test_days=63)
+

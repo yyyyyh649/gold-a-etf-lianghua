@@ -27,6 +27,7 @@ from strategies.rotation_strategy import (
 	generate_signals,
 	parameter_sweep,
 	performance_summary,
+	walk_forward_validation,
 )
 from adapters.variety_adapter import DummyAdapter
 
@@ -194,11 +195,102 @@ def run_sweep(
 	print(f"\nSaved sweep results to {path}")
 
 
+def run_walk_forward(
+	equity_symbol: str = "510300",
+	start_date: str = "2015-01-01",
+	end_date: Optional[str] = None,
+	rebalance: str = "weekly",
+	train_days: int = 504,
+	test_days: int = 126,
+):
+	"""Run rolling out-of-sample (walk-forward) validation."""
+	try:
+		gold = fetch_gold_futures(start_date=start_date, end_date=end_date)
+		equity = fetch_a_share_index_or_etf(
+			symbol=equity_symbol, start_date=start_date, end_date=end_date
+		)
+	except Exception as exc:
+		logger.error("Data fetch failed: %s", exc)
+		raise SystemExit(1) from exc
+
+	try:
+		wf = walk_forward_validation(
+			gold, equity, train_days=train_days, test_days=test_days, rebalance=rebalance
+		)
+	except ValueError as exc:
+		logger.error("Walk-forward validation failed: %s", exc)
+		raise SystemExit(1) from exc
+
+	splits = wf["splits"]
+	metrics = wf["metrics"]
+	bench_metrics = wf["benchmark_metrics"]
+
+	print(
+		f"\n样本外滚动验证（walk-forward） 训练={train_days}日 测试={test_days}日 "
+		f"调仓={rebalance}"
+	)
+	print(f"切分数: {len(splits)}，参数分布: {splits['lookback'].value_counts().to_dict()}")
+	print("\n切分明细:")
+	print(
+		splits.to_string(
+			index=False,
+			formatters={
+				"train_start": lambda x: f"{x:%Y-%m-%d}",
+				"train_end": lambda x: f"{x:%Y-%m-%d}",
+				"test_start": lambda x: f"{x:%Y-%m-%d}",
+				"test_end": lambda x: f"{x:%Y-%m-%d}",
+				"train_score": lambda x: f"{x:.4f}",
+				"test_return": lambda x: f"{x:.2%}",
+				"benchmark_return": lambda x: f"{x:.2%}",
+			},
+		)
+	)
+
+	cn_labels = {
+		"cagr": "年化收益率",
+		"vol": "波动率",
+		"sharpe": "夏普比率",
+		"max_drawdown": "最大回撤",
+		"calmar": "卡玛比率",
+	}
+	print("\n样本外绩效 vs 基准（买入持有）:")
+	print(f"  {'指标':<10} {'策略':>10} {'基准':>10}")
+	print(f"  {'-' * 30}")
+	for k in ("cagr", "vol", "sharpe", "max_drawdown", "calmar"):
+		label = cn_labels.get(k, k)
+		sv = metrics.get(k, float("nan"))
+		bv = bench_metrics.get(k, float("nan"))
+		if k in ("cagr", "vol", "max_drawdown"):
+			print(f"  {label:<10} {sv:>9.2%} {bv:>9.2%}")
+		else:
+			print(f"  {label:<10} {sv:>9.4f} {bv:>9.4f}")
+
+	print(f"\n样本外策略期末净值: {metrics.get('last_value', float('nan')):.4f}")
+	print(f"样本外基准期末净值: {bench_metrics.get('last_value', float('nan')):.4f}")
+
+	oos = pd.concat(
+		[
+			wf["oos_returns"].rename("oos_strategy_ret"),
+			wf["oos_benchmark_returns"].rename("oos_benchmark_ret"),
+		],
+		axis=1,
+	)
+	path = save_data(oos.reset_index().rename(columns={"index": "Date"}), f"walkforward_{equity_symbol}.csv")
+	print(f"\nSaved walk-forward results to {path}")
+
+
 if __name__ == "__main__":
 	logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 	parser = argparse.ArgumentParser(description="Validate gold/ETF rotation strategy")
 	parser.add_argument("--sweep", action="store_true", help="Run multi-window parameter comparison")
+	parser.add_argument(
+		"--walk-forward",
+		action="store_true",
+		help="Run rolling out-of-sample (walk-forward) validation",
+	)
+	parser.add_argument("--train-days", type=int, default=504, help="Walk-forward train window (trading days)")
+	parser.add_argument("--test-days", type=int, default=126, help="Walk-forward test window (trading days)")
 	parser.add_argument("--equity", default="510300", help="A-share ETF/index code")
 	parser.add_argument("--start", default="2015-01-01", help="Start date YYYY-MM-DD")
 	parser.add_argument("--lookback", type=int, default=60, help="Momentum lookback days")
@@ -208,6 +300,14 @@ if __name__ == "__main__":
 
 	if args.sweep:
 		run_sweep(equity_symbol=args.equity, start_date=args.start, rebalance=args.rebalance)
+	elif args.walk_forward:
+		run_walk_forward(
+			equity_symbol=args.equity,
+			start_date=args.start,
+			rebalance=args.rebalance,
+			train_days=args.train_days,
+			test_days=args.test_days,
+		)
 	else:
 		run_validation(
 			equity_symbol=args.equity,

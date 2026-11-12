@@ -127,10 +127,11 @@ flowchart TB
 - 卡玛比率（Calmar = CAGR / |MaxDD|）
 - 日 / 年化换手率
 
-### 5. 参数扫描
+### 5. 参数扫描与样本外验证
 
 - 内置 `parameter_sweep()`，默认对比 `20 / 60 / 120` 日窗口。
-- 一键输出多周期 CAGR / 夏普 / 回撤 / Calmar / 期末净值对比表。
+- 一键输出多周期 CAGR / 夏普 / 回撤 / Calmar / 期末净值对比表，并附基准与超额指标。
+- 内置 `walk_forward_validation()`：滚动窗口内选参、窗口外检验，拼接样本外净值，避免参数选择的前视偏差。
 
 ### 6. 实盘适配器接口
 
@@ -260,6 +261,9 @@ python backtests/validate_strategy.py \
 
 # 多周期参数扫描
 python backtests/validate_strategy.py --sweep
+
+# 样本外滚动验证（walk-forward）
+python backtests/validate_strategy.py --walk-forward --train-days 504 --test-days 126
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -270,6 +274,9 @@ python backtests/validate_strategy.py --sweep
 | `--rebalance` | `weekly` | 调仓频率（daily/weekly/monthly）|
 | `--fee` | `5.0` | 单边手续费（bps）|
 | `--sweep` | `false` | 启用多周期参数对比 |
+| `--walk-forward` | `false` | 启用样本外滚动验证 |
+| `--train-days` | `504` | walk-forward 训练窗口（交易日）|
+| `--test-days` | `126` | walk-forward 测试窗口（交易日）|
 
 ### 网络注意事项
 

@@ -297,3 +297,105 @@ def performance_summary(returns: pd.Series, trading_days_per_year: int = 252) ->
 		"calmar": calmar,
 		"last_value": last_val,
 	}
+
+
+def walk_forward_validation(
+	gold: pd.DataFrame,
+	equity: pd.DataFrame,
+	lookback_windows: Optional[List[int]] = None,
+	train_days: int = 504,
+	test_days: int = 126,
+	rebalance: Rebalance = "weekly",
+	select_metric: str = "sharpe",
+) -> dict:
+	"""Rolling walk-forward (out-of-sample) validation.
+
+	On each split, every candidate lookback is scored on the *training* window
+	only; the best one is then applied to the following *test* window. Test
+	returns are stitched together into one out-of-sample track record, so the
+	reported metrics contain no parameter-selection look-ahead.
+
+	Args:
+		lookback_windows: Candidate momentum windows to choose from.
+		train_days: Training window length in trading days.
+		test_days: Out-of-sample window length in trading days (also the step).
+		rebalance: Rebalance frequency.
+		select_metric: Metric from ``performance_summary`` used to pick a window
+			(``"sharpe"``, ``"calmar"`` or ``"cagr"``).
+
+	Returns:
+		Dict with ``oos_returns``, ``oos_benchmark_returns``, ``metrics``,
+		``benchmark_metrics`` and a per-split ``splits`` DataFrame.
+	"""
+	if lookback_windows is None:
+		lookback_windows = [20, 60, 120]
+	if train_days <= 0 or test_days <= 0:
+		raise ValueError("train_days and test_days must be positive")
+	if select_metric not in {"sharpe", "calmar", "cagr"}:
+		raise ValueError(f"Unsupported select_metric: {select_metric}")
+
+	frames: Dict[int, pd.DataFrame] = {
+		lb: generate_signals(gold, equity, config=RotationConfig(lookback_days=lb, rebalance=rebalance))
+		for lb in lookback_windows
+	}
+	reference = next(iter(frames.values()))
+	if reference.empty:
+		raise ValueError("No overlapping price data to run walk-forward validation")
+
+	index = reference.index
+	n_days = len(index)
+	if n_days < train_days + test_days:
+		raise ValueError(
+			f"Not enough data for walk-forward: {n_days} days "
+			f"< train({train_days}) + test({test_days})"
+		)
+
+	def _train_score(result: pd.DataFrame, window: pd.DatetimeIndex) -> float:
+		# Score only on data available in the training window, trimming each
+		# candidate's own warm-up so short lookbacks are not unfairly favoured.
+		sample = result.loc[window]
+		valid = sample[["mom_gold", "mom_equity"]].notna().all(axis=1)
+		if valid.any():
+			sample = sample.loc[valid.idxmax():]
+		return performance_summary(sample["portfolio_ret"]).get(select_metric, float("nan"))
+
+	splits = []
+	oos_returns = []
+	oos_benchmarks = []
+	start = 0
+	while start + train_days + test_days <= n_days:
+		train_idx = index[start:start + train_days]
+		test_idx = index[start + train_days:start + train_days + test_days]
+
+		scores = {lb: _train_score(res, train_idx) for lb, res in frames.items()}
+		chosen = max(scores, key=lambda lb: scores[lb] if pd.notna(scores[lb]) else -np.inf)
+
+		test_result = frames[chosen].loc[test_idx]
+		test_ret = test_result["portfolio_ret"]
+		test_bench = test_result["equity_ret"]
+		oos_returns.append(test_ret)
+		oos_benchmarks.append(test_bench)
+		splits.append(
+			{
+				"train_start": train_idx[0],
+				"train_end": train_idx[-1],
+				"test_start": test_idx[0],
+				"test_end": test_idx[-1],
+				"lookback": chosen,
+				"train_score": scores[chosen],
+				"test_return": float((1 + test_ret).prod() - 1),
+				"benchmark_return": float((1 + test_bench).prod() - 1),
+			}
+		)
+		start += test_days
+
+	oos_ret = pd.concat(oos_returns)
+	oos_bench = pd.concat(oos_benchmarks)
+
+	return {
+		"oos_returns": oos_ret,
+		"oos_benchmark_returns": oos_bench,
+		"metrics": performance_summary(oos_ret),
+		"benchmark_metrics": performance_summary(oos_bench),
+		"splits": pd.DataFrame(splits),
+	}
