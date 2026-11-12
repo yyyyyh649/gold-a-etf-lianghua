@@ -248,6 +248,49 @@ def _fetch_a_share_from_sina(code: str, is_etf: bool) -> pd.DataFrame:
     return ak.stock_zh_index_daily(symbol=sina_symbol)
 
 
+def _adjust_etf_for_dividends(df: pd.DataFrame, sina_symbol: str) -> pd.DataFrame:
+    """Apply forward (qfq) adjustment to a Sina ETF series using its dividends.
+
+    Sina's ETF history is unadjusted. We rebuild a total-return-like series by
+    multiplying pre-ex-date OHLC by ``1 - dividend / prev_close`` for every
+    cash distribution, which is the standard ratio-based qfq method.
+    """
+    try:
+        div = ak.fund_etf_dividend_sina(symbol=sina_symbol)
+    except Exception as exc:
+        logger.warning("ETF dividend fetch failed (%s); using unadjusted prices", exc)
+        return df
+    if div is None or div.empty or not {"日期", "累计分红"}.issubset(div.columns):
+        return df
+
+    div = div.copy()
+    div["日期"] = pd.to_datetime(div["日期"])
+    div["累计分红"] = pd.to_numeric(div["累计分红"], errors="coerce")
+    div = div.dropna().sort_values("日期")
+    if div.empty:
+        return df
+    # Convert the cumulative series into per-event cash dividends.
+    div["dividend"] = div["累计分红"].diff().fillna(div["累计分红"])
+
+    out = df.sort_values("Date").reset_index(drop=True)
+    price_cols = ["Open", "High", "Low", "Close"]
+    for _, event in div.iterrows():
+        ex_date, amount = event["日期"], float(event["dividend"])
+        if amount <= 0:
+            continue
+        prior = out.loc[out["Date"] < ex_date, "Close"]
+        if prior.empty:
+            continue
+        prev_close = float(prior.iloc[-1])
+        if prev_close <= 0 or amount >= prev_close:
+            continue
+        ratio = 1.0 - amount / prev_close
+        older = out["Date"] < ex_date
+        out.loc[older, price_cols] = out.loc[older, price_cols] * ratio
+
+    return out
+
+
 def fetch_a_share_index_or_etf(
     symbol: str, start_date: str, end_date: Optional[str] = None, is_etf: Optional[bool] = None
 ) -> pd.DataFrame:
@@ -270,6 +313,7 @@ def fetch_a_share_index_or_etf(
     if is_etf is None:
         is_etf = code.startswith(("5", "1"))
 
+    used_sina = False
     try:
         if is_etf:
             raw = ak.fund_etf_hist_em(
@@ -289,9 +333,16 @@ def fetch_a_share_index_or_etf(
     except Exception as exc:
         logger.warning("Eastmoney A-share fetch failed (%s); falling back to Sina", exc)
         raw = _fetch_a_share_from_sina(code, is_etf)
+        used_sina = True
 
     cleaned = _clean_price_dataframe(raw, symbol=code)
-    return _filter_date_range(cleaned, start, end_dt)
+    cleaned = _filter_date_range(cleaned, start, end_dt)
+
+    # Eastmoney already returns qfq prices; Sina history is unadjusted.
+    if used_sina and is_etf:
+        cleaned = _adjust_etf_for_dividends(cleaned, _sina_quote_symbol(code, True))
+
+    return cleaned
 
 
 def save_data(df: pd.DataFrame, filename: str) -> Path:
